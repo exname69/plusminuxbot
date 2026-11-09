@@ -12,3 +12,4 @@ data/
 
 secrets/*
 !secrets/.gitkeep
+!secrets/service-account-test.json
