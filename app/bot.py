@@ -5,7 +5,7 @@ import logging
 import os
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -15,6 +15,7 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
+from .access import AccessPolicy, may_dispatch_message
 from .parser import ParseError, Entry, parse_message
 from .storage import Storage, period_bounds
 from .sheets_backup import SheetsBackup
@@ -23,7 +24,7 @@ router = Router()
 storage: Storage
 currency: str
 sheets_backup: SheetsBackup | None = None
-admin_id: int | None = None
+access_policy: AccessPolicy
 backup_hour: int = 3
 backup_lock = asyncio.Lock()
 
@@ -37,14 +38,51 @@ MENU = ReplyKeyboardMarkup(
 )
 
 MENU_ADMIN = ReplyKeyboardMarkup(
-    keyboard=[*MENU.keyboard, [KeyboardButton(text="📤 Выгрузить")]],
+    keyboard=[
+        *MENU.keyboard,
+        [KeyboardButton(text="👥 Пользователи"), KeyboardButton(text="📈 Все пользователи")],
+        [KeyboardButton(text="📤 Выгрузить")],
+    ],
     resize_keyboard=True,
     input_field_placeholder="+100 или -50 аренда",
 )
 
 
 def menu_for(user_id: int) -> ReplyKeyboardMarkup:
-    return MENU_ADMIN if admin_id is not None and user_id == admin_id and sheets_backup else MENU
+    return MENU_ADMIN if access_policy.is_admin(user_id) else MENU
+
+
+class AccessMessageMiddleware(BaseMiddleware):
+    """Default deny for messages, except /id to help bootstrap allowlists."""
+
+    def __init__(self, policy: AccessPolicy):
+        self.policy = policy
+
+    async def __call__(self, handler, event: Message, data: dict):
+        sender = event.from_user
+        if sender is None:
+            return None
+        if may_dispatch_message(self.policy, sender.id, event.text):
+            return await handler(event, data)
+        await event.answer(
+            "⛔ Нет доступа к боту.\n"
+            f"Твой Telegram ID: {sender.id}\n"
+            "Попроси администратора добавить ID в ALLOWED_USER_IDS."
+        )
+        return None
+
+
+class AccessCallbackMiddleware(BaseMiddleware):
+    """Callback buttons must be protected as well as text commands."""
+
+    def __init__(self, policy: AccessPolicy):
+        self.policy = policy
+
+    async def __call__(self, handler, event: CallbackQuery, data: dict):
+        if not self.policy.is_allowed(event.from_user.id):
+            await event.answer("⛔ Нет доступа", show_alert=True)
+            return None
+        return await handler(event, data)
 
 
 class EditTransaction(StatesGroup):
@@ -86,21 +124,33 @@ HELP = (
     "📊 Сегодня · 📅 Неделя · 💰 Месяц · 📋 История\n"
     "/undo — отменить последнюю запись\n"
     "/balance — итог за всё время\n"
-    "/backup — выгрузить копию в Google Sheets (только владелец)\n"
     "/id — узнать свой Telegram ID\n"
     "/cancel — выйти из изменения записи"
 )
 
 
+ADMIN_HELP = (
+    "\n\n👑 Администратору:\n"
+    "/users — разрешённые пользователи\n"
+    "/stats ID [today|week|month|all] — статистика по ID\n"
+    "/allstats [today|week|month|all] — общая статистика\n"
+    "/backup — выгрузить в Google Sheets"
+)
+
+
+def help_for(user_id: int) -> str:
+    return HELP + (ADMIN_HELP if access_policy.is_admin(user_id) else "")
+
+
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Привет! 👋\n\n" + HELP, reply_markup=menu_for(message.from_user.id))
+    await message.answer("Привет! 👋\n\n" + help_for(message.from_user.id), reply_markup=menu_for(message.from_user.id))
 
 
 @router.message(Command("help"))
 async def help_command(message: Message) -> None:
-    await message.answer(HELP, reply_markup=menu_for(message.from_user.id))
+    await message.answer(help_for(message.from_user.id), reply_markup=menu_for(message.from_user.id))
 
 
 @router.message(Command("cancel"))
@@ -133,8 +183,8 @@ async def export_sheets():
 @router.message(Command("backup"))
 @router.message(F.text == "📤 Выгрузить")
 async def backup_now(message: Message) -> None:
-    if admin_id is None or message.from_user.id != admin_id:
-        await message.answer("⛔ Ручная выгрузка доступна только владельцу. Для настройки: /id")
+    if not access_policy.is_admin(message.from_user.id):
+        await message.answer("⛔ Ручная выгрузка доступна только администратору.")
         return
     if sheets_backup is None:
         await message.answer("⚠️ Google Sheets не настроен. Заполни GOOGLE_SHEET_ID в .env")
@@ -170,11 +220,11 @@ async def scheduled_backup_loop(bot: Bot) -> None:
                 failure_notification_day = None
             except Exception:
                 logging.exception("Daily Sheets backup failed; will retry in 15 minutes")
-                if admin_id and failure_notification_day != day:
+                if failure_notification_day != day:
                     failure_notification_day = day
                     try:
                         await bot.send_message(
-                            admin_id, "⚠️ Резервное копирование Google Sheets не удалось. "
+                            access_policy.notification_admin_id, "⚠️ Резервное копирование Google Sheets не удалось. "
                                       "Проверь логи: docker compose logs bot"
                         )
                     except Exception:
@@ -199,6 +249,112 @@ async def send_report(message: Message, period: str) -> None:
         f"━━━━━━━━━━\n"
         f"💰 Итого: {format_money(totals.net, explicit_plus=True)}\n"
         f"Операций: {totals.count}"
+    )
+
+
+PERIOD_NAMES = {"today": "сегодня", "week": "за неделю", "month": "за месяц", "all": "за всё время"}
+PERIOD_ALIASES = {
+    "today": "today", "сегодня": "today",
+    "week": "week", "неделя": "week",
+    "month": "month", "месяц": "month",
+    "all": "all", "всё": "all", "все": "all",
+}
+
+
+def parse_period(value: str) -> str | None:
+    return PERIOD_ALIASES.get(value.lower().strip())
+
+
+async def require_admin(message: Message) -> bool:
+    if access_policy.is_admin(message.from_user.id):
+        return True
+    await message.answer("⛔ Команда доступна только администратору.")
+    return False
+
+
+async def send_long_message(message: Message, heading: str, lines: list[str]) -> None:
+    """Keep each Telegram response under its maximum message size."""
+    chunk = heading
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3500:
+            await message.answer(chunk)
+            chunk = heading + " (продолжение)"
+        chunk += "\n" + line
+    await message.answer(chunk)
+
+
+@router.message(Command("users"))
+@router.message(F.text == "👥 Пользователи")
+async def admin_users(message: Message) -> None:
+    if not await require_admin(message):
+        return
+    ids = access_policy.all_user_ids
+    start, end = period_bounds("month", storage.tz)
+    stats = storage.period_totals_many(ids, start, end)
+    lines = []
+    for user_id in ids:
+        role = "админ" if access_policy.is_admin(user_id) else "пользователь"
+        totals = stats[user_id]
+        lines.append(
+            f"{user_id} ({role}) — {format_money(totals.net, explicit_plus=True)} "
+            f"· {totals.count} оп."
+        )
+    lines.append("")
+    lines.append("Подробнее: /stats ID month")
+    await send_long_message(message, "👥 Разрешённые пользователи · текущий месяц", lines)
+
+
+@router.message(Command("stats"))
+async def admin_user_stats(message: Message) -> None:
+    if not await require_admin(message):
+        return
+    args = (message.text or "").split()[1:]
+    if not args or len(args) > 2 or not args[0].isascii() or not args[0].isdecimal():
+        await message.answer("Формат: /stats TELEGRAM_ID [today|week|month|all]\nПример: /stats 123456789 month")
+        return
+    user_id = int(args[0])
+    if not access_policy.is_allowed(user_id):
+        await message.answer("⛔ Этот ID отсутствует в ALLOWED_USER_IDS и ADMIN_USER_IDS.")
+        return
+    period = parse_period(args[1]) if len(args) == 2 else "month"
+    if period is None:
+        await message.answer("Период: today, week, month или all")
+        return
+    start, end = period_bounds(period, storage.tz)
+    totals = storage.period_totals(user_id, start, end)
+    await message.answer(
+        f"📊 Пользователь {user_id} · {PERIOD_NAMES[period]}\n\n"
+        f"➕ Приход: {format_money(totals.income)}\n"
+        f"➖ Расход: {format_money(totals.expenses)}\n"
+        f"━━━━━━━━━━\n"
+        f"💰 Итого: {format_money(totals.net, explicit_plus=True)}\n"
+        f"Операций: {totals.count}"
+    )
+
+
+@router.message(Command("allstats"))
+@router.message(F.text == "📈 Все пользователи")
+async def admin_all_stats(message: Message) -> None:
+    if not await require_admin(message):
+        return
+    args = (message.text or "").split()[1:] if (message.text or "").startswith("/") else []
+    if len(args) > 1 or (args and parse_period(args[0]) is None):
+        await message.answer("Формат: /allstats [today|week|month|all]")
+        return
+    period = parse_period(args[0]) if args else "month"
+    start, end = period_bounds(period, storage.tz)
+    stats = storage.period_totals_many(access_policy.all_user_ids, start, end)
+    income = sum(item.income for item in stats.values())
+    expenses = sum(item.expenses for item in stats.values())
+    count = sum(item.count for item in stats.values())
+    await message.answer(
+        f"📈 Все разрешённые пользователи · {PERIOD_NAMES[period]}\n\n"
+        f"➕ Приход: {format_money(income)}\n"
+        f"➖ Расход: {format_money(expenses)}\n"
+        f"━━━━━━━━━━\n"
+        f"💰 Итого: {format_money(income - expenses, explicit_plus=True)}\n"
+        f"Операций: {count}\n"
+        f"Пользователей: {len(stats)}"
     )
 
 
@@ -328,7 +484,7 @@ async def add_record(message: Message) -> None:
 
 
 async def main() -> None:
-    global storage, currency, sheets_backup, admin_id, backup_hour
+    global storage, currency, sheets_backup, access_policy, backup_hour
     load_dotenv()
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token or token == "PASTE_BOTFATHER_TOKEN_HERE":
@@ -341,14 +497,10 @@ async def main() -> None:
     storage = Storage(os.getenv("DB_PATH", "data/finance.sqlite3"), tz)
     storage.initialize()
     currency = os.getenv("CURRENCY", "").strip()
-    admin_text = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
-    if admin_text:
-        try:
-            admin_id = int(admin_text)
-            if admin_id <= 0:
-                raise ValueError
-        except ValueError as exc:
-            raise SystemExit("ADMIN_TELEGRAM_ID должен быть положительным числом") from exc
+    try:
+        access_policy = AccessPolicy.from_env(os.environ)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     try:
         backup_hour = int(os.getenv("BACKUP_HOUR", "3"))
         retention = int(os.getenv("BACKUP_RETENTION_DAYS", "30"))
@@ -367,6 +519,9 @@ async def main() -> None:
 
     bot = Bot(token=token)
     dispatcher = Dispatcher()
+    # Outer middlewares apply to EVERY registered handler, including FSM edits and callbacks.
+    router.message.outer_middleware(AccessMessageMiddleware(access_policy))
+    router.callback_query.outer_middleware(AccessCallbackMiddleware(access_policy))
     router.message.filter(F.chat.type == "private")
     router.callback_query.filter(F.message.chat.type == "private")
     dispatcher.include_router(router)
@@ -380,9 +535,9 @@ async def main() -> None:
         BotCommand(command="balance", description="Итоги за всё время"),
         BotCommand(command="help", description="Помощь"),
         BotCommand(command="id", description="Узнать свой Telegram ID"),
-        BotCommand(command="backup", description="Выгрузить в Google Sheets"),
     ])
-    logging.info("Bot started. Timezone=%s, DB=%s", tz_str, storage.path)
+    logging.info("Bot started. Timezone=%s, DB=%s, allowed_users=%s, admins=%s",
+                 tz_str, storage.path, len(access_policy.all_user_ids), len(access_policy.admins))
     backup_task = asyncio.create_task(scheduled_backup_loop(bot)) if sheets_backup else None
     if sheets_backup:
         logging.info("Google Sheets daily backup enabled at %02d:00", backup_hour)

@@ -30,6 +30,23 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(row["id"], first[1])
         self.assertEqual(self.db.period_totals(101, None, None).net, 10000)
 
+    def test_admin_aggregates_only_approved_ids_and_ignores_deleted(self):
+        self.db.add_entries(101, 101, 1, parse_message("+100\n-30"))
+        self.db.add_entries(202, 202, 1, parse_message("+80"))
+        self.db.add_entries(303, 303, 1, parse_message("+99999"))
+        self.assertIsNotNone(self.db.undo_last(202))
+        totals = self.db.period_totals_many((101, 202, 404), None, None)
+        self.assertEqual(set(totals), {101, 202, 404})
+        self.assertEqual(totals[101].net, 7000)
+        self.assertEqual(totals[101].count, 2)
+        self.assertEqual(totals[202].net, 0)
+        self.assertEqual(totals[202].count, 0)
+        self.assertEqual(totals[404].count, 0)
+        self.assertEqual(self.db.period_totals_many((), None, None), {})
+        self.assertEqual(sum(x.net for x in totals.values()), 7000)
+        # The admin aggregate does not touch any other user's balance.
+        self.assertEqual(self.db.period_totals(303, None, None).net, 9999900)
+
     def test_dates(self):
         tz = ZoneInfo("Europe/Zurich")
         now = datetime(2026, 11, 9, 12, 0, tzinfo=tz)

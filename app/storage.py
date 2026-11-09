@@ -151,6 +151,32 @@ class Storage:
             ).fetchone()
         return Totals(row["income"], row["expenses"], row["count"])
 
+    def period_totals_many(
+        self, user_ids: tuple[int, ...], start: int | None, end: int | None
+    ) -> dict[int, Totals]:
+        """Admin read-only report for an explicit list of allowed Telegram IDs."""
+        if not user_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in user_ids)
+        conditions = [f"user_id IN ({placeholders})", "deleted_ts IS NULL"]
+        params: list[int] = list(user_ids)
+        if start is not None:
+            conditions.append("operation_ts >= ?")
+            params.append(start)
+        if end is not None:
+            conditions.append("operation_ts < ?")
+            params.append(end)
+        query = f"""SELECT user_id,
+                   COALESCE(SUM(CASE WHEN amount_minor > 0 THEN amount_minor ELSE 0 END), 0) AS income,
+                   COALESCE(SUM(CASE WHEN amount_minor < 0 THEN -amount_minor ELSE 0 END), 0) AS expenses,
+                   COUNT(*) AS count
+                   FROM transactions WHERE {' AND '.join(conditions)} GROUP BY user_id"""
+        result = {user_id: Totals(0, 0, 0) for user_id in user_ids}
+        with self._connection() as conn:
+            for row in conn.execute(query, params):
+                result[row["user_id"]] = Totals(row["income"], row["expenses"], row["count"])
+        return result
+
     def recent(self, user_id: int, limit: int = 10) -> list[sqlite3.Row]:
         with self._connection() as conn:
             return conn.execute(
