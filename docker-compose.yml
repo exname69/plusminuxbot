@@ -1,0 +1,16 @@
+name: plusminuxbot
+
+services:
+  bot:
+    build: .
+    env_file: .env
+    environment:
+      DB_PATH: /data/finance.sqlite3
+      GOOGLE_CREDENTIALS_FILE: /secrets/service-account.json
+    volumes:
+      - bot_data:/data
+      - ./secrets:/secrets:ro
+    restart: unless-stopped
+
+volumes:
+  bot_data:
